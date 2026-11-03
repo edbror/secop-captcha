@@ -1,0 +1,85 @@
+# ── Environment & Secrets ──────────────────────────────────
+.env
+.env.*
+!.env.example
+
+# ── Dependencies ───────────────────────────────────────────
+node_modules/
+package-lock.json
+.pnpm-store/
+
+# ── Debug / scratch / exploration scripts ──────────────────
+scratch/
+demo_frames/
+
+*.bak
+*.debug
+*.tmp
+*.temp
+
+# Debug/test scripts with common naming patterns
+*debug*.js
+*debug*.ts
+*debug*.py
+*debug*.sh
+*scratch*.js
+*scratch*.ts
+*explore*.js
+*explore*.ts
+*temp*.js
+*temp*.ts
+*test_access*.js
+*test_verify*.js
+*test_execute*.js
+*test_session*.js
+*check_*.js
+*check_*.ts
+*find_*.js
+*inspect_*.js
+*show_*.js
+*final*.js
+*after_*.js
+*before_*.js
+*previous_*.js
+*iframe_*.html
+
+# ── Screenshots & captured frames ──────────────────────────
+*.png
+*.jpg
+*.jpeg
+*.gif
+*.webp
+*.webm
+
+# ...except known data dirs (tracked intentionally)
+!frames/
+!padded/
+
+# ── Videos & recordings ────────────────────────────────────
+*.mp4
+*.mov
+*.avi
+*.mkv
+*.webm
+
+# ── IDE & Editor ──────────────────────────────────────────
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+*.sublime-*
+.DS_Store
+Thumbs.db
+
+# ── Logs & coverage ───────────────────────────────────────
+*.log
+logs/
+coverage/
+.nyc_output/
+
+# ── Build & output artifacts ──────────────────────────────
+dist/
+build/
+*.bundle.js
+*.map

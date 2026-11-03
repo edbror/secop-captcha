@@ -1,0 +1,33 @@
+{
+  "name": "secop-captcha",
+  "version": "1.0.0",
+  "description": "reCAPTCHA solving service for SECOP Colombia",
+  "main": "src/server-ponytail.js",
+  "scripts": {
+    "start": "node src/server-ponytail.js",
+    "dev": "node --watch src/server-ponytail.js",
+    "solve": "node src/solver-ponytail.js solve",
+    "solve-puppeteer": "node src/solver-ponytail.js solve-puppeteer",
+    "verify": "node src/solver-ponytail.js verify",
+    "check": "node src/solver-ponytail.js check",
+    "test": "node test/solver.test.js",
+    "e2e": "node test/e2e.test.js"
+  },
+  "dependencies": {
+    "dotenv": "^18.0.9",
+    "puppeteer": "^23.0.0"
+  },
+  "engines": {
+    "node": ">=18.0.0"
+  },
+  "keywords": [
+    "secop",
+    "recaptcha",
+    "captcha",
+    "colombia"
+  ],
+  "license": "ISC",
+  "devDependencies": {
+    "supertest": "7.3.1"
+  }
+}
