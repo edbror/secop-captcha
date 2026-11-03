@@ -294,7 +294,7 @@ async function handleSolve(req, res) {
     console.error('POST /solve error:', err.message);
     sendJson(res, 500, {
       success: false,
-      error: err.message,
+      error: 'internal server error',
     });
   }
 }
@@ -326,7 +326,7 @@ async function handleVerify(req, res) {
     sendJson(res, 200, { success: true, google, secop });
   } catch (err) {
     console.error('POST /verify error:', err.message);
-    sendJson(res, 500, { success: false, error: err.message });
+    sendJson(res, 500, { success: false, error: 'internal server error' });
   }
 }
 
@@ -376,7 +376,7 @@ async function router(req, res) {
     handleSolve(req, res).catch(err => {
       console.error('POST /solve unhandled:', err.message);
       if (!res.headersSent) {
-        sendJson(res, 500, { success: false, error: err.message });
+        sendJson(res, 500, { success: false, error: 'internal server error' });
       }
     });
     return;
@@ -386,7 +386,7 @@ async function router(req, res) {
     handleVerify(req, res).catch(err => {
       console.error('POST /verify unhandled:', err.message);
       if (!res.headersSent) {
-        sendJson(res, 500, { success: false, error: err.message });
+        sendJson(res, 500, { success: false, error: 'internal server error' });
       }
     });
     return;

@@ -15,7 +15,7 @@
   },
   "dependencies": {
     "dotenv": "^18.0.9",
-    "puppeteer": "^23.0.0"
+    "puppeteer": "^25.16.0"
   },
   "engines": {
     "node": ">=18.0.0"
