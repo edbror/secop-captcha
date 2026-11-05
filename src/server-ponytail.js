@@ -7,9 +7,14 @@
  *
  * API (compatible with secop-scraper Python client):
  *   POST /solve   {"method":"service","url":"..."}  → {"success":true,"token":"..."}
- *   POST /verify  {"token":"..."}                   → verification result
+ *   POST /verify  {"token":"..."}                   → passive token validation
  *   GET  /health                                → {"status":"ok"}
  *   GET  /redirect                              → redirect URL JSON
+ *
+ * Token lifecycle: /solve returns a SINGLE-USE token (expires ~2 min).
+ * The caller must submit it to SECOP's CaptchaCheck itself — this server
+ * never verifies returned tokens, because siteverify/CaptchaCheck would
+ * consume them and the caller's submission would be rejected as a duplicate.
  */
 
 require('dotenv').config();
@@ -19,12 +24,10 @@ const { URL } = require('url');
 const {
   solve,
   solveWithPuppeteer,
-  verifyWithGoogle,
-  checkWithSecop,
-  checkWithSecopBrowser,
+  fetchSecopMkey,
   SITE_KEY,
-  DEFAULT_MKEY,
-  shouldSkipGoogleVerification,
+  SECOP_CAPTCHA_CHECK_URL,
+  TOKEN_TTL_SECONDS,
 } = require('./solver-ponytail');
 
 // ---------------------------------------------------------------------------
@@ -39,13 +42,6 @@ const FARM_SERVICE = process.env.FARM_SERVICE || '2captcha';
 
 // 2Captcha API key (used by farm)
 const RECAPTCHA_SERVICE_KEY = process.env.RECAPTCHA_SERVICE_KEY || '';
-
-// Google siteverify secret key — NOTE: SITE_KEY is public, not secret.
-// Google siteverify always fails with the site key; VERIFY_WITH_GOOGLE=false is required.
-const GOOGLE_SECRET_KEY = SITE_KEY;
-
-// Whether to skip Google verification entirely
-const SKIP_GOOGLE = shouldSkipGoogleVerification();
 
 // Validate API keys at startup
 const apiKey = process.env.RECAPTCHA_SERVICE_KEY;
@@ -179,18 +175,6 @@ function validateSolveInput(body) {
   return errors;
 }
 
-function validateVerifyInput(body) {
-  const errors = [];
-
-  if (!body.token || typeof body.token !== 'string') {
-    errors.push('token is required and must be a string');
-  } else if (body.token.length < 50) {
-    errors.push('token appears to be too short');
-  }
-
-  return errors;
-}
-
 // ---------------------------------------------------------------------------
 // Request body parser — no body-parser needed
 // ---------------------------------------------------------------------------
@@ -250,6 +234,8 @@ async function handleSolve(req, res) {
         success: true,
         token: 'FAKE_TOKEN_123456789012345678901234567890',
         method: 'mock',
+        solvedAt: new Date().toISOString(),
+        expiresIn: TOKEN_TTL_SECONDS,
       });
       return;
     }
@@ -259,29 +245,22 @@ async function handleSolve(req, res) {
       token = await solveWithPuppeteer(url);
       serviceUsed = 'puppeteer';
     } else {
-      // Solve via 2Captcha / CapSolver farm
-      const farm = fallback && FARM_SERVICE !== 'capsolver' ? 'capsolver' : FARM_SERVICE;
-      token = await solve(SITE_KEY, farm);
-      serviceUsed = fallback && farm === 'capsolver' ? 'CapSolver (fallback)' : `${farm === 'capsolver' ? 'CapSolver' : '2Captcha'}`;
+      // Solve via the configured farm. solve() already falls back to the
+      // other farm when its key is configured; the client's `fallback`
+      // flag is accepted for compatibility but does NOT flip the primary
+      // farm (it used to send every request to CapSolver first).
+      token = await solve(SITE_KEY, FARM_SERVICE);
+      serviceUsed = FARM_SERVICE === 'capsolver' ? 'CapSolver' : '2Captcha';
     }
 
-    // Verify with Google (or skip if configured)
-    let google;
-    if (SKIP_GOOGLE) {
-      google = { success: true, skipped: true, hostname: 'community.secop.gov.co' };
-    } else {
-      google = await verifyWithGoogle(token, SITE_KEY); // ponytail: GOOGLE_SECRET_KEY was just SITE_KEY with a misleading name
-    }
-
-    // Check with SECOP
-    const secop = await checkWithSecop(token);
-
+    // NO verification step: Google siteverify and SECOP's CaptchaCheck both
+    // consume single-use tokens. The caller submits the token to SECOP itself.
     sendJson(res, 200, {
       success: true,
       token,
-      google,
-      secop,
       method: serviceUsed,
+      solvedAt: new Date().toISOString(),
+      expiresIn: TOKEN_TTL_SECONDS,
     });
   } catch (err) {
     console.error('POST /solve error:', err.message);
@@ -304,33 +283,37 @@ async function handleVerify(req, res) {
       return sendJson(res, 400, { success: false, error: 'Validation failed', details: ['token appears to be too short'] });
     }
 
-    const { token } = body;
-
-    let google;
-    if (SKIP_GOOGLE) {
-      google = { success: true, skipped: true, hostname: 'community.secop.gov.co' };
-    } else {
-      google = await verifyWithGoogle(token, SITE_KEY);
-    }
-    const secop = await checkWithSecopBrowser(token);
-
-    sendJson(res, 200, { success: true, google, secop });
+    // Passive validation only. Real validation (Google siteverify, SECOP
+    // CaptchaCheck) consumes the single-use token — that happens once, in the
+    // caller's session, when it submits the token to SECOP.
+    sendJson(res, 200, {
+      success: true,
+      valid: true,
+      length: body.token.length,
+      singleUse: true,
+      ttlSeconds: TOKEN_TTL_SECONDS,
+      note: 'Passive validation only. Submitting the token to SECOP CaptchaCheck consumes it.',
+    });
   } catch (err) {
     console.error('POST /verify error:', err.message);
     sendJson(res, 500, { success: false, error: 'internal server error' });
   }
 }
 
-function handleRedirect(req, res) {
+async function handleRedirect(req, res) {
   const urlObj = new URL(req.url, `http://localhost:${PORT}`);
   const previousUrl = urlObj.searchParams.get('previousUrl')
     || 'https://community.secop.gov.co/Public/Tendering/ContractNoticeManagement/Index?currentLanguage=es-CO&Page=login&Country=CO&SkinName=CCE';
+
+  // Live mkey only — a hardcoded one is always stale and produces the
+  // "página expirada" ErrorPage.
+  const mkey = await fetchSecopMkey();
 
   sendJson(res, 200, {
     success: true,
     captchaPage: 'https://community.secop.gov.co/Public/Common/GoogleReCaptcha/Index',
     redirectUrl: previousUrl,
-    captchaCheckUrl: 'https://community.secop.gov.co/Public/Common/GoogleReCaptcha/CaptchaCheck?mkey=' + DEFAULT_MKEY, // ponytail: replaced deprecated url.format() with template literal
+    captchaCheckUrl: mkey ? `${SECOP_CAPTCHA_CHECK_URL}?mkey=${mkey}` : null,
     siteKey: SITE_KEY,
   });
 }
@@ -379,7 +362,13 @@ async function router(req, res) {
   }
 
   if (req.method === 'GET' && pathname === '/redirect') {
-    return handleRedirect(req, res);
+    handleRedirect(req, res).catch(err => {
+      console.error('GET /redirect unhandled:', err.message);
+      if (!res.headersSent) {
+        sendJson(res, 500, { success: false, error: 'internal server error' });
+      }
+    });
+    return;
   }
 
   sendJson(res, 404, {
@@ -412,7 +401,8 @@ function sendJson(res, statusCode, data) {
 // ---------------------------------------------------------------------------
 
 const server = http.createServer((req, res) => {
-  // ponytail: concurrency gate — clean increment, safe decrement via finally
+  // ponytail: concurrency gate — decrement when the response actually ends,
+  // not synchronously (async handlers are still in flight then)
   if (activeRequests >= MAX_CONCURRENT) {
     console.warn('[' + new Date().toISOString() + '] Concurrency limit reached (' + activeRequests + '/' + MAX_CONCURRENT + ')');
     sendJson(res, 429, {
@@ -422,18 +412,23 @@ const server = http.createServer((req, res) => {
     return;
   }
   activeRequests++;
+  let released = false;
+  const release = () => {
+    if (!released) {
+      released = true;
+      activeRequests--;
+    }
+  };
+  res.on('finish', release);
+  res.on('close', release);
 
-  try {
-    authMiddleware(req, res, () => {
-      rateLimitMiddleware(req, res, () => {
-        logMiddleware(req, res, () => {
-          router(req, res);
-        });
+  authMiddleware(req, res, () => {
+    rateLimitMiddleware(req, res, () => {
+      logMiddleware(req, res, () => {
+        router(req, res);
       });
     });
-  } finally {
-    activeRequests--;
-  }
+  });
 });
 
 server.listen(PORT, HOST, () => {
@@ -442,7 +437,7 @@ server.listen(PORT, HOST, () => {
   console.log('');
   console.log('  Routes:');
   console.log(`    POST /solve    — Solve reCAPTCHA`);
-  console.log(`    POST /verify   — Verify token`);
+  console.log(`    POST /verify   — Passive token validation`);
   console.log(`    GET  /health   — Health check`);
   console.log(`    GET  /redirect — Redirect URL info`);
   console.log('');
@@ -451,14 +446,17 @@ server.listen(PORT, HOST, () => {
   console.log(`    Site:         ${SITE_KEY}`);
   console.log(`    2Cap:         ${RECAPTCHA_SERVICE_KEY ? `${RECAPTCHA_SERVICE_KEY.substring(0, 4)}...` : '(not set)'}`);
   console.log(`    CapSol:       ${process.env.CAPSOLVER_API_KEY ? '(set)' : '(not set)'}`);
-  console.log(`    VerifyGoogle: ${SKIP_GOOGLE ? 'skipped' : 'enabled'}`);
+  console.log(`    Mock:         ${process.env.MOCK_SOLVER === 'true' ? 'ENABLED (fake tokens!)' : 'off'}`);
   console.log(`    RateLimit:    ${RATE_LIMIT_MAX_REQUESTS} req/${RATE_LIMIT_WINDOW_MS / 1000}s per IP`);
+  console.log('');
+  console.log('  Tokens are single-use (~2 min TTL). /solve does NOT verify them —');
+  console.log('  the caller submits each token to SECOP CaptchaCheck exactly once.');
   console.log('');
   console.log('  Environment:');
   console.log('    RECAPTCHA_SERVICE_KEY  — 2Captcha API key');
   console.log('    CAPSOLVER_API_KEY      — CapSolver API key');
   console.log('    FARM_SERVICE           — "2captcha" or "capsolver"');
-  console.log('    VERIFY_WITH_GOOGLE     — "true" (default) or "false" to skip Google siteverify');
+  console.log('    MOCK_SOLVER            — "true" to return fake tokens (testing)');
   console.log('    PORT                   — Server port (default: 3000)');
   console.log('    PUPPETEER_EXECUTABLE_PATH — Chrome binary path');
   console.log('');

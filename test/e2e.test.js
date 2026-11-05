@@ -1,16 +1,17 @@
 #!/usr/bin/env node
 /**
- * e2e.test.js — End-to-end tests for secop-captcha server.
+ * e2e.test.js — HTTP tests for the secop-captcha server, fully offline.
  *
- * Two modes:
- *   MODE=real   — hits live farm (2Captcha/CapSolver), verifies token with Google + SECOP. Requires RECAPTCHA_SERVICE_KEY or CAPSOLVER_API_KEY. Costs money per solve (~$0.003-0.007 per solve).
- *   MODE=http   — starts local server in-process and exercises routes via HTTP (no external API calls). Fast, free.
+ * The server runs in-process with MOCK_SOLVER=true and a mocked global.fetch
+ * (for /redirect's live mkey lookup), so no farm, Google or SECOP calls happen.
  *
- * Run fast (HTTP mode):      node test/e2e.test.js
- * Run real (live solves):    MODE=real node test/e2e.test.js
+ * For live verification (paid farm solve → SECOP submission) use:
+ *   npm run live         (free checks only)
+ *   npm run live:paid    (runs one paid end-to-end solve, ~$0.003)
+ *
+ * Run: npm run e2e
  */
 
-const http = require('http');
 const supertest = require('supertest');
 
 const TEST_PORT = 3099;
@@ -19,6 +20,7 @@ const API_KEY = 'test-e2e-api-key';
 // Create a fresh server instance for testing
 let server;
 let agent;
+let realFetch;
 
 async function startServer() {
   // Set up environment for testing
@@ -27,8 +29,19 @@ async function startServer() {
   process.env.SECOP_CAPTCHA_API_KEY = API_KEY;
   process.env.PORT = TEST_PORT;
   process.env.FARM_SERVICE = '2captcha';
-  process.env.VERIFY_WITH_GOOGLE = 'false';
   process.env.HOST = '127.0.0.1';
+  process.env.MOCK_SOLVER = 'true';
+
+  // Mock fetch so /redirect's live mkey lookup stays offline
+  realFetch = global.fetch;
+  global.fetch = async () => ({
+    status: 200,
+    url: 'https://community.secop.gov.co/Public/Common/GoogleReCaptcha/Index',
+    headers: { getSetCookie: () => ['ASP.NET_SessionId=e2e; Path=/'] },
+    text: async () =>
+      `<button id="btnCaptchaCheckButton" onclick="location.href='/Public/Common/GoogleReCaptcha/CaptchaCheck?responseKey=x&amp;mkey=e2e7113a_4716_4a39_ac70_aa44898aee3c'">`,
+    json: async () => { throw new Error('not json'); },
+  });
 
   // Clear module cache to get fresh instance
   Object.keys(require.cache).forEach(key => {
@@ -52,94 +65,16 @@ async function startServer() {
 
 function stopServer() {
   return new Promise((resolve) => {
+    if (realFetch) {
+      global.fetch = realFetch;
+      realFetch = null;
+    }
     if (server) {
       server.close(() => resolve());
     } else {
       resolve();
     }
   });
-}
-
-// ---------------------------------------------------------------------------
-// Real solve E2E mode (MODE=real)
-// Calls live 2Captcha/CapSolver farm → verifies with Google → checks SECOP
-// ---------------------------------------------------------------------------
-
-const {
-  solve,
-  verifyWithGoogle,
-  checkWithSecop,
-  shouldSkipGoogleVerification,
-  SITE_KEY,
-} = require('../src/solver-ponytail');
-
-let isRealMode = process.env.MODE === 'real';
-
-/**
- * Run a complete solve flow end-to-end using live farms.
- * This is what matters — it proves the service works as the scraper will use it.
- */
-async function runRealSolveTest() {
-  console.log('\n=== REAL SOLVE FLOW (live API calls) ===');
-  console.log('Note: costs ~$0.003-0.007 per attempt\n');
-
-  const farm = process.env.FARM_SERVICE || '2captcha';
-  const skipGoogle = shouldSkipGoogleVerification();
-
-  // Step 1: Solve via farm
-  console.log('[1/3] Solving reCAPTCHA via ' + farm + '...');
-  let token;
-  try {
-    token = await solve(SITE_KEY, farm);
-  } catch (err) {
-    throw new Error('Step 1 FAIL: Farm returned error — ' + err.message);
-  }
-
-  if (!token || token.length < 50) {
-    throw new Error('Step 1 FAIL: Got invalid token (' + JSON.stringify(token)?.substring(0, 100) + ')');
-  }
-  console.log('  ✓ Token received: ' + token.substring(0, 40) + '... (' + token.length + ' chars)');
-
-  // Step 2: Verify with Google
-  if (skipGoogle) {
-    console.log('\n[2/3] Google siteverify skipped (VERIFY_WITH_GOOGLE=false)');
-    console.log('  ℹ️  Note: siteverify with SITE_KEY always fails; token is accepted anyway.');
-  } else {
-    console.log('\n[2/3] Verifying token with Google...');
-    let googleResult;
-    try {
-      googleResult = await verifyWithGoogle(token, SITE_KEY);
-    } catch (err) {
-      throw new Error('Step 2 FAIL: Google verification threw — ' + err.message);
-    }
-    console.log('  success: ' + googleResult.success);
-    console.log('  hostname: ' + (googleResult.hostname || '(none)'));
-    console.log('  score: ' + (googleResult.score ?? '(none)'));
-    console.log('  action: ' + (googleResult.action || '(none)'));
-    if (googleResult.error) {
-      console.log('  ⚠️  note: ' + googleResult.error + ' (expected — we pass SITE_KEY which is public, not the secret)');
-    }
-  }
-
-  // Step 3: Check with SECOP — THIS IS THE REAL TEST
-  console.log('\n[3/3] Checking token validity with SECOP...');
-  let secopResult;
-  try {
-    secopResult = await checkWithSecop(token);
-  } catch (err) {
-    throw new Error('Step 3 FAIL: SECOP check threw — ' + err.message);
-  }
-
-  console.log('  success: ' + secopResult.success);
-  console.log('  status: ' + (secopResult.status || '(none)'));
-  console.log('  url: ' + (secopResult.url || '(none)'));
-
-  if (!secopResult.success) {
-    throw new Error('SECOP rejected the token! Status: ' + JSON.stringify(secopResult));
-  }
-
-  console.log('\n  ✅ FULL FLOW PASSED — SECOP accepted the token');
-  return { token, google: null, secop: secopResult };
 }
 
 let passed = 0;
@@ -168,15 +103,9 @@ async function test(name, fn) {
   }
 }
 
-// ---------------------------------------------------------------------------
-// Test runner — pick mode
-// ---------------------------------------------------------------------------
-
-let allPassed = true;
-
 async function runHttpTests() {
-  console.log('SECOP Captcha HTTP E2E Tests (local server)');
-  console.log('============================================\n');
+  console.log('SECOP Captcha HTTP E2E Tests (local server, MOCK_SOLVER, offline)');
+  console.log('====================================================================\n');
 
   await startServer();
 
@@ -193,13 +122,19 @@ async function runHttpTests() {
     assert(res.headers['access-control-allow-origin'] === '*', 'CORS header present');
   });
 
-  // 2. Solve endpoint - service method
-  await test('POST /solve with method=service returns 200 or 500', async () => {
+  // 2. Solve endpoint - mock response shape (no google/secop fields)
+  await test('POST /solve (mock) returns 200 with the no-consume response shape', async () => {
     const res = await agent.post('/solve')
       .send({ method: 'service' })
       .set('X-API-Key', API_KEY);
-    assert(res.status === 200 || res.status === 500, 'status is 200 or 500 (not 400/401)');
-    assert(res.body.success !== undefined, 'body.success is present');
+    assert(res.status === 200, 'status is 200');
+    assert(res.body.success === true, 'body.success is true');
+    assert(typeof res.body.token === 'string' && res.body.token.length > 0, 'body.token is a non-empty string');
+    assert(res.body.method === 'mock', 'body.method is "mock"');
+    assert(typeof res.body.solvedAt === 'string', 'body.solvedAt is an ISO string');
+    assert(typeof res.body.expiresIn === 'number' && res.body.expiresIn > 60, 'body.expiresIn is ~2 minutes');
+    assert(res.body.google === undefined, 'body.google is absent (no Google verify — it would consume the token)');
+    assert(res.body.secop === undefined, 'body.secop is absent (no SECOP check — it would consume the token)');
   });
 
   // 3. Solve endpoint - missing auth
@@ -222,13 +157,18 @@ async function runHttpTests() {
     assert(hasUrlError, 'details includes url error');
   });
 
-  // 5. Verify endpoint
-  await test('POST /verify returns 200 or 500', async () => {
+  // 5. Verify endpoint - passive validation (no token consumption)
+  await test('POST /verify returns 200 passive validation, does not consume the token', async () => {
     const res = await agent.post('/verify')
       .send({ token: '03AGdBq26TestTokenValueLongEnoughForVerification12345' })
       .set('X-API-Key', API_KEY);
-    assert(res.status === 200 || res.status === 500, 'status is 200 or 500');
-    assert(res.body.success !== undefined, 'body.success is present');
+    assert(res.status === 200, 'status is 200');
+    assert(res.body.success === true, 'body.success is true');
+    assert(res.body.valid === true, 'body.valid is true');
+    assert(res.body.singleUse === true, 'body.singleUse is true');
+    assert(typeof res.body.length === 'number', 'body.length is present');
+    assert(res.body.google === undefined, 'body.google is absent');
+    assert(res.body.secop === undefined, 'body.secop is absent');
   });
 
   // 6. Verify endpoint - missing token
@@ -250,14 +190,15 @@ async function runHttpTests() {
     assert(hasShortError, 'details includes token short error');
   });
 
-  // 8. Redirect endpoint
-  await test('GET /redirect returns 200 with correct structure', async () => {
+  // 8. Redirect endpoint - live-mkey based captchaCheckUrl
+  await test('GET /redirect returns 200 with a live-mkey captchaCheckUrl', async () => {
     const res = await agent.get('/redirect');
     assert(res.status === 200, 'status is 200');
     assert(res.body.success === true, 'body.success is true');
     assert(typeof res.body.captchaPage === 'string', 'body.captchaPage is present');
     assert(typeof res.body.redirectUrl === 'string', 'body.redirectUrl is present');
-    assert(typeof res.body.captchaCheckUrl === 'string', 'body.captchaCheckUrl is present');
+    assert(typeof res.body.captchaCheckUrl === 'string', 'body.captchaCheckUrl is a string (live mkey)');
+    assert(res.body.captchaCheckUrl.includes('mkey=e2e7113a'), 'captchaCheckUrl uses the extracted live mkey');
     assert(typeof res.body.siteKey === 'string', 'body.siteKey is present');
   });
 
@@ -309,12 +250,13 @@ async function runHttpTests() {
     assert(res.status === 200, 'status is 200 (no auth required)');
   });
 
-  // 16. Solve with valid URL for puppeteer method
-  await test('POST /solve with method=puppeteer and valid url returns 200 or 500', async () => {
+  // 16. Solve with valid URL for puppeteer method (mocked — no browser launch)
+  await test('POST /solve with method=puppeteer and valid url returns 200 (mock)', async () => {
     const res = await agent.post('/solve')
       .send({ method: 'puppeteer', url: 'https://community.secop.gov.co' })
       .set('X-API-Key', API_KEY);
-    assert(res.status === 200 || res.status === 500, 'status is 200 or 500');
+    assert(res.status === 200, 'status is 200');
+    assert(res.body.method === 'mock', 'body.method is "mock"');
   });
 
   // 17. Solve with invalid URL format
@@ -335,13 +277,13 @@ async function runHttpTests() {
     assert(hasHostError, 'details includes hostname error');
   });
 
-  // 19. Solve with fallback to capsolver
-  await test('POST /solve with fallback=true switches to capsolver', async () => {
+  // 19. Solve with fallback flag (mocked)
+  await test('POST /solve with fallback=true returns 200 (mock)', async () => {
     const res = await agent.post('/solve')
       .send({ method: 'service', fallback: true })
       .set('X-API-Key', API_KEY);
-    assert(res.status === 200 || res.status === 500, 'status is 200 or 500');
-    assert(res.body.success !== undefined, 'body.success is present');
+    assert(res.status === 200, 'status is 200');
+    assert(res.body.success === true, 'body.success is true');
   });
 
   // 20. Solve with invalid method
@@ -358,25 +300,25 @@ async function runHttpTests() {
     const res = await agent.post('/verify')
       .send({ token: '03AGdBq26TestTokenValueLongEnoughForVerificationAndValidation' })
       .set('X-API-Key', API_KEY);
-    assert(res.status === 200 || res.status === 500, 'status is 200 or 500');
+    assert(res.status === 200, 'status is 200');
     assert(res.body.success === true, 'body.success is true');
   });
 
-  // 22. POST /solve without body
-  await test('POST /solve without body returns 200 or 500', async () => {
+  // 22. POST /solve without body (defaults to method=service, mocked)
+  await test('POST /solve without body returns 200 (mock)', async () => {
     const res = await agent.post('/solve')
       .set('X-API-Key', API_KEY);
-    assert(res.status === 200 || res.status === 500, 'status is 200 or 500');
+    assert(res.status === 200, 'status is 200');
+    assert(res.body.success === true, 'body.success is true');
   });
 
   // 23. POST /solve with invalid JSON
-  await test('POST /solve with invalid JSON returns 400', async () => {
+  await test('POST /solve with invalid JSON returns 500', async () => {
     const res = await agent.post('/solve')
       .set('X-API-Key', API_KEY)
       .set('Content-Type', 'application/json')
       .send('not-valid-json');
-    // Should return 400 due to JSON parse error
-    assert(res.status === 400 || res.status === 500, 'status is 400 or 500');
+    assert(res.status === 500, 'status is 500 (body parse error)');
   });
 
   // 24. GET /health with query params
@@ -403,43 +345,11 @@ async function runHttpTests() {
   return failed === 0;
 }
 
-async function runAllTests() {
-  let httpPassed = true;
-
-  if (!isRealMode) {
-    // HTTP-only mode (fast, free)
-    console.log('[mode] HTTP (local server, no live API calls)\n');
-    try {
-      httpPassed = await runHttpTests();
-    } finally {
-      await stopServer();
-    }
-  } else {
-    // Real mode: HTTP tests first, then live solve flow
-    console.log('[mode] REAL (live API calls — costs money)\n');
-    try {
-      httpPassed = await runHttpTests();
-    } finally {
-      await stopServer();
-    }
-
-    // Live solve flow
-    try {
-      await runRealSolveTest();
-    } catch (err) {
-      allPassed = false;
-      console.error('\n  ✗ REAL SOLVE FLOW: ' + err.message);
-    }
-  }
-
-  return httpPassed && allPassed;
-}
-
 // ---------------------------------------------------------------------------
 // Entry point
 // ---------------------------------------------------------------------------
 
-runAllTests().then((success) => {
+runHttpTests().then((success) => {
   stopServer().then(() => {
     process.exit(success ? 0 : 1);
   });

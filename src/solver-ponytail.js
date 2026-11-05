@@ -2,20 +2,27 @@
 /**
  * solver-ponytail.js — SECOP reCAPTCHA solver (single-file, zero-framework).
  *
- * Solves Google reCAPTCHA v2 for SECOP Colombia via 2Captcha / CapSolver,
- * then verifies the token with Google's siteverify API and SECOP's
- * CaptchaCheck endpoint.
+ * Solves Google reCAPTCHA v2 for SECOP Colombia via 2Captcha / CapSolver
+ * and returns the raw token. Tokens are SINGLE-USE and expire ~2 minutes
+ * after the farm generates them: nothing in this module may submit a token
+ * to Google's siteverify or SECOP's CaptchaCheck before handing it to the
+ * caller, or the caller's own submission will be rejected as a duplicate.
  *
  * Usage (CLI):
  *   node src/solver-ponytail.js solve [url]
- *   node src/solver-ponytail.js verify <token>
- *   node src/solver-ponytail.js check <token>
+ *   node src/solver-ponytail.js solve-puppeteer [url]
+ *   node src/solver-ponytail.js balance
+ *   node src/solver-ponytail.js verify <token>   (Google siteverify — consumes the token)
+ *   node src/solver-ponytail.js check <token>    (SECOP CaptchaCheck — consumes the token)
  */
 
 // ---------------------------------------------------------------------------
 // Configuration — all external-facing constants live here for easy audit
 // ---------------------------------------------------------------------------
 const SITE_KEY = '6LcMmakZAAAAAB157Q90hORUGtNd790TCws4vBNw';
+
+const SECOP_CAPTCHA_INDEX_URL =
+  'https://community.secop.gov.co/Public/Common/GoogleReCaptcha/Index';
 
 const SECOP_CAPTCHA_CHECK_URL =
   'https://community.secop.gov.co/Public/Common/GoogleReCaptcha/CaptchaCheck';
@@ -28,23 +35,24 @@ const _2CAPTCHA_RES = 'https://2captcha.com/res.php';
 
 // CapSolver API endpoints
 const CAPSOLVER_CREATE = 'https://api.capsolver.com/createTask';
-const CAPSOLVER_GET_RESULT = 'https://api.capsolver.com/getResult';
+const CAPSOLVER_RESULT = 'https://api.capsolver.com/getTaskResult';
 
 // User-agent masquerade
 const USER_AGENT =
   'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) ' +
   'AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36';
 
-// Default SECOP mkey (extracted at runtime when possible)
-const DEFAULT_MKEY = '0e94415a_d4f8_4b12_ae54_d46c22ee953c';
+// reCAPTCHA tokens are single-use and valid for ~2 minutes after generation
+const TOKEN_TTL_SECONDS = 110;
 
 // Polling intervals
 const _2CAPTCHA_POLL_MS = 1000;   // 1 s between 2Captcha polls
 const _2CAPTCHA_MAX_POLLS = 120;  // up to 2 min
 const CAPSOLVER_POLL_MS = 3000;   // 3 s between CapSolver polls
 const CAPSOLVER_MAX_POLLS = 40;   // up to 2 min
-const TOKEN_POLL_MS = 200;        // 200 ms waiting for recaptcha-token
-const TOKEN_MAX_POLLS = 15;       // up to 3 s
+const TOKEN_POLL_MS = 500;        // 500 ms waiting for recaptcha-token
+const TOKEN_MAX_POLLS = 60;       // up to 30 s
+const TOKEN_CHALLENGE_GRACE_POLLS = 10; // 5 s before declaring an interactive challenge
 
 // ponytail: replaced 87-line httpJson with native fetch — same behavior, zero deps
 
@@ -56,8 +64,13 @@ const TOKEN_MAX_POLLS = 15;       // up to 3 s
 /**
  * Submit a reCAPTCHA task to 2Captcha and poll until solved.
  * Returns the response token string.
+ *
+ * 2Captcha JSON responses are {status: 1|0, request: <id|token|ERROR_CODE>};
+ * errors arrive in `request`, never in an `error` field.
  */
-async function solveVia2Captcha(apiKey, siteKey) {
+async function solveVia2Captcha(apiKey, siteKey, opts = {}) {
+  const pollDelayMs = Number.isFinite(opts.pollDelayMs) ? opts.pollDelayMs : _2CAPTCHA_POLL_MS;
+
   // Submit task
   const submit = await fetch(_2CAPTCHA_IN, {
     method: 'POST',
@@ -65,61 +78,62 @@ async function solveVia2Captcha(apiKey, siteKey) {
     body: JSON.stringify({
       key: apiKey,
       method: 'userrecaptcha',
-      pageurl: 'https://community.secop.gov.co/Public/Common/GoogleReCaptcha/Index',
+      pageurl: SECOP_CAPTCHA_INDEX_URL,
       googlekey: siteKey,
       json: 1,
     }),
   });
   const submitBody = await submit.json();
+  const captchaId = submitBody.request;
 
-  if (submitBody.error) {
-    throw new Error(`2Captcha submit error: ${submitBody.error}`);
+  if (submitBody.status === 0 || (typeof captchaId === 'string' && captchaId.startsWith('ERROR_'))) {
+    throw new Error(`2Captcha submit error: ${captchaId || JSON.stringify(submitBody)}`);
   }
-
-  const captchaId = submitBody.request || submitBody.captcha;
   if (!captchaId) {
     throw new Error(`2Captcha returned no captcha ID: ${JSON.stringify(submitBody)}`);
   }
 
   // Poll for result
   for (let i = 0; i < _2CAPTCHA_MAX_POLLS; i++) {
-    await delay(_2CAPTCHA_POLL_MS);
+    await delay(pollDelayMs);
 
     const poll = await fetch(
       `${_2CAPTCHA_RES}?key=${apiKey}&action=get&id=${captchaId}&json=1`
     );
     const raw = await poll.text();
-    let pollBody;
+    let body;
     try {
-      pollBody = JSON.parse(raw);
+      body = JSON.parse(raw);
     } catch {
-      pollBody = raw;
+      // Plain-text responses: the token, "CAPCHA_NOT_READY" or "ERROR_..."
+      body = { status: 1, request: raw };
     }
 
-    const data = typeof pollBody === 'string' ? pollBody : pollBody;
-
-    if (data === 'CAPCHA_NOT_READY' || (typeof data === 'object' && data.request === 'CAPCHA_NOT_READY')) {
+    if (body.request === 'CAPCHA_NOT_READY') {
       continue;
     }
-    
-    const requestStr = typeof data === 'object' ? data.request : data;
-    
-    if (requestStr === 'ERROR_CAPTCHA_UNSOLVABLE' || pollBody.error) {
-      throw new Error(`2Captcha solve failed: ${pollBody.error || requestStr}`);
+    if (body.status === 0 || (typeof body.request === 'string' && body.request.startsWith('ERROR_'))) {
+      throw new Error(`2Captcha solve failed: ${body.request || JSON.stringify(body)}`);
     }
 
-    if (typeof requestStr === 'string' && requestStr.startsWith('ERROR_')) {
-      throw new Error(`2Captcha solve failed: ${requestStr}`);
-    }
-
-    const token = typeof data === 'string'
-      ? data
-      : (pollBody.token?.token || pollBody.token || pollBody.request);
-
+    const token = typeof body === 'string' ? body : body.request;
     return token;
   }
 
   throw new Error('2Captcha: timeout after polling');
+}
+
+/**
+ * Check the 2Captcha account balance (free call, does not solve anything).
+ * Returns the balance as a number.
+ */
+async function get2CaptchaBalance(apiKey) {
+  const res = await fetch(`${_2CAPTCHA_RES}?key=${apiKey}&action=getbalance&json=1`);
+  const body = await res.json();
+  if (body.status === 0 || (typeof body.request === 'string' && body.request.startsWith('ERROR_'))) {
+    throw new Error(`2Captcha balance error: ${body.request || JSON.stringify(body)}`);
+  }
+  return parseFloat(body.request);
 }
 
 // ---------------------------------------------------------------------------
@@ -130,8 +144,14 @@ async function solveVia2Captcha(apiKey, siteKey) {
 /**
  * Submit a reCAPTCHA task to CapSolver and poll until solved.
  * Returns the response token string.
+ *
+ * Task type must be ReCaptchaV2TaskProxyLess (CapSolver naming) and the
+ * polling endpoint is getTaskResult; the token arrives in
+ * solution.gRecaptchaResponse.
  */
-async function solveViaCapSolver(apiKey, siteKey) {
+async function solveViaCapSolver(apiKey, siteKey, opts = {}) {
+  const pollDelayMs = Number.isFinite(opts.pollDelayMs) ? opts.pollDelayMs : CAPSOLVER_POLL_MS;
+
   // Create task
   const create = await fetch(CAPSOLVER_CREATE, {
     method: 'POST',
@@ -139,25 +159,29 @@ async function solveViaCapSolver(apiKey, siteKey) {
     body: JSON.stringify({
       clientKey: apiKey,
       task: {
-        type: 'CapSolverRecaptchaTaskProxyless',
-        websiteURL: 'https://community.secop.gov.co/Public/Common/GoogleReCaptcha/Index',
+        type: 'ReCaptchaV2TaskProxyLess',
+        websiteURL: SECOP_CAPTCHA_INDEX_URL,
         websiteKey: siteKey,
       },
     }),
   });
   const createBody = await create.json();
 
-  if (createBody.errorId && createBody.errorId !== 0 && createBody.errorId !== 1) {
+  // errorId !== 0 means an error (1 = key/parameter problems, 2 = usage problems)
+  if (createBody.errorId) {
     throw new Error(`CapSolver createTask error: ${createBody.errorCode} - ${createBody.errorMessage}`);
   }
 
   const taskId = createBody.taskId;
+  if (!taskId) {
+    throw new Error(`CapSolver returned no task ID: ${JSON.stringify(createBody)}`);
+  }
 
   // Poll for result
   for (let i = 0; i < CAPSOLVER_MAX_POLLS; i++) {
-    await delay(CAPSOLVER_POLL_MS);
+    await delay(pollDelayMs);
 
-    const result = await fetch(CAPSOLVER_GET_RESULT, {
+    const result = await fetch(CAPSOLVER_RESULT, {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify({
@@ -169,9 +193,9 @@ async function solveViaCapSolver(apiKey, siteKey) {
     const data = raw.startsWith('{') ? JSON.parse(raw) : { errorId: 2, errorCode: 'NO_RESPONSE', errorMessage: 'No response from CapSolver' };
 
     if (data.status === 'ready' && data.solution) {
-      return data.solution.token || data.solution.gRecaptchaResponse;
+      return data.solution.gRecaptchaResponse || data.solution.token;
     }
-    if (data.errorId && data.errorId !== 0) {
+    if (data.errorId) {
       throw new Error(`CapSolver error: ${data.errorCode} - ${data.errorMessage}`);
     }
   }
@@ -203,41 +227,71 @@ async function verifyWithGoogle(token, secretKey) {
 }
 
 /**
- * Check the token with SECOP's CaptchaCheck endpoint.
- * GET with query params (matches secop-scraper Python client behavior).
- * Returns the raw response text and parsed status.
+ * Fetch the live SECOP Captcha Index page and extract the per-page-load mkey
+ * plus the session cookie it was issued with. The mkey is only valid inside
+ * the session that requested it — keep both together.
  */
+async function fetchSecopSession() {
+  const res = await fetch(SECOP_CAPTCHA_INDEX_URL, {
+    headers: { 'User-Agent': USER_AGENT },
+  });
+  const raw = await res.text();
+  const mkeyMatch = raw.match(/mkey=([a-f0-9_]+)/);
+
+  let cookie = '';
+  try {
+    const setCookies =
+      (typeof res.headers.getSetCookie === 'function' && res.headers.getSetCookie()) || [];
+    cookie = setCookies.map((c) => c.split(';')[0]).join('; ');
+  } catch {
+    // no cookie header — proceed without it
+  }
+
+  return { mkey: mkeyMatch ? mkeyMatch[1] : null, cookie };
+}
+
 /**
- * Fetch the live SECOP Captcha Index page and extract the dynamic mkey.
- * Parses the onclick attribute of btnCaptchaCheckButton for the mkey param.
+ * Convenience wrapper: just the live mkey (or null).
  */
 async function fetchSecopMkey() {
-  // ponytail: was 11 lines with httpJson; fetch does fetch + .text() in 3 lines
   try {
-    const res = await fetch('https://community.secop.gov.co/Public/Common/GoogleReCaptcha/Index');
-    const raw = await res.text();
-    const mkeyMatch = raw.match(/mkey=([a-f0-9_]+)/);
-    return mkeyMatch ? mkeyMatch[1] : null;
+    const { mkey } = await fetchSecopSession();
+    return mkey;
   } catch {
     return null;
   }
 }
 
 /**
- * Check token with SECOP via direct HTTP (fast path).
- * If mkey is not provided, fetches it live from the SECOP page.
+ * Check token with SECOP via direct HTTP.
+ *
+ * DESTRUCTIVE: submitting a token to CaptchaCheck consumes it (single-use).
+ * Use only for diagnostics — never on a token the caller still needs.
+ *
+ * If mkey is not provided, fetches one live along with its session cookie
+ * so the mkey and the request at least belong to the same session.
  */
 async function checkWithSecop(token, mkey) {
-  // ponytail: was 26 lines with httpJson; fetch handles redirects natively
   let mk = mkey;
+  let cookie = '';
   if (!mk) {
-    mk = await fetchSecopMkey();
-    if (!mk) mk = DEFAULT_MKEY;
+    const session = await fetchSecopSession();
+    mk = session.mkey;
+    cookie = session.cookie;
+  }
+  if (!mk) {
+    throw new Error('Could not extract a live mkey from the SECOP captcha page — aborting instead of submitting with a stale one');
   }
 
   const url = `${SECOP_CAPTCHA_CHECK_URL}?responseKey=${encodeURIComponent(token)}&mkey=${encodeURIComponent(mk)}`;
 
-  const res = await fetch(url);
+  const res = await fetch(url, {
+    headers: {
+      'User-Agent': USER_AGENT,
+      Referer: SECOP_CAPTCHA_INDEX_URL,
+      ...(cookie ? { Cookie: cookie } : {}),
+    },
+  });
   const finalUrl = res.url; // fetch follows redirects, .url is the final URL
   const success = !finalUrl.includes('ErrorPage') && res.status !== 403;
 
@@ -252,11 +306,12 @@ async function checkWithSecop(token, mkey) {
 }
 
 /**
- * Check token with SECOP via headless browser (slow, but reliable).
- * Follows the exact flow of the secop-scraper Python client:
- * 1. Navigates to the Captcha Index page to establish a session.
- * 2. Extracts the dynamic 'mkey' from the page.
- * 3. Navigates to the CaptchaCheck endpoint with the token and mkey.
+ * Check token with SECOP via headless browser — the only reliable shape for
+ * this check: one session loads the Index page, extracts the mkey issued to
+ * that session, and submits CaptchaCheck from that same session.
+ *
+ * DESTRUCTIVE: submitting a token to CaptchaCheck consumes it (single-use).
+ * Use only for diagnostics/live tests — never on a token the caller still needs.
  */
 async function checkWithSecopBrowser(token, siteKey = SITE_KEY) {
   const puppeteer = require('puppeteer');
@@ -290,38 +345,40 @@ async function checkWithSecopBrowser(token, siteKey = SITE_KEY) {
 
     // Step 1: Navigate to the Index page to establish session and extract mkey
     // This mimics the user journey where the token is generated for this specific page/session
-    const targetUrl = `https://community.secop.gov.co/Public/Common/GoogleReCaptcha/Index?previousUrl=${encodeURIComponent('https://community.secop.gov.co/Public/Tendering/ContractNoticeManagement/Index?currentLanguage=es-CO&Page=login&Country=CO&SkinName=CCE')}`;
-    
+    const targetUrl = `${SECOP_CAPTCHA_INDEX_URL}?previousUrl=${encodeURIComponent('https://community.secop.gov.co/Public/Tendering/ContractNoticeManagement/Index?currentLanguage=es-CO&Page=login&Country=CO&SkinName=CCE')}`;
+
     console.log('  Navigating to Captcha Index to establish session...');
     await page.goto(targetUrl, { waitUntil: 'networkidle0', timeout: 15000 });
 
-    // Step 2: Extract the dynamic mkey from the page
-    let mkey = DEFAULT_MKEY;
-    try {
-      mkey = await page.evaluate(() => {
-        try {
-          const btn = document.getElementById('btnCaptchaCheckButton');
-          if (!btn) return null;
-          const onClick = btn.getAttribute('onclick') || '';
-          const match = onClick.match(/mkey=([a-f0-9_]+)/);
-          return match ? match[1] : null;
-        } catch {
-          return null;
-        }
-      });
-
-      if (!mkey) {
-        console.log('  Warning: Could not extract mkey from button, using default.');
+    // Step 2: Extract the dynamic mkey from the page — no fallback: a stale
+    // mkey guarantees the "página expirada" ErrorPage
+    const mkey = await page.evaluate(() => {
+      try {
+        const btn = document.getElementById('btnCaptchaCheckButton');
+        if (!btn) return null;
+        const onClick = btn.getAttribute('onclick') || '';
+        const match = onClick.match(/mkey=([a-f0-9_]+)/);
+        return match ? match[1] : null;
+      } catch {
+        return null;
       }
-    } catch (err) {
-      console.log('  Warning: mkey extraction failed, using default.');
+    });
+
+    if (!mkey) {
+      return {
+        success: false,
+        status: 0,
+        url: targetUrl,
+        finalUrl: page.url(),
+        error: 'Could not extract mkey from btnCaptchaCheckButton — page structure may have changed',
+      };
     }
 
     // Step 3: Navigate directly to the CaptchaCheck endpoint with the token and extracted mkey
     // The Python scraper does exactly this after extracting the mkey
-    const checkUrl = `${SECOP_CAPTCHA_CHECK_URL}?responseKey=${encodeURIComponent(token)}&mkey=${encodeURIComponent(mkey || DEFAULT_MKEY)}`;
+    const checkUrl = `${SECOP_CAPTCHA_CHECK_URL}?responseKey=${encodeURIComponent(token)}&mkey=${encodeURIComponent(mkey)}`;
     console.log('  Navigating to CaptchaCheck with extracted mkey...');
-    
+
     try {
       const response = await page.goto(checkUrl, { waitUntil: 'networkidle0', timeout: 15000 });
       const status = response ? response.status() : 0;
@@ -330,14 +387,14 @@ async function checkWithSecopBrowser(token, siteKey = SITE_KEY) {
       console.log('  Response status: ' + status);
       console.log('  Final URL: ' + finalUrl.substring(0, 150));
 
-      const success = !finalUrl.includes('ErrorPage') && !finalUrl.includes('expired');
+      const success = !finalUrl.includes('ErrorPage') && !finalUrl.includes('expired') && !finalUrl.includes('GoogleReCaptcha');
 
       return {
         success,
         status,
         url: checkUrl,
         finalUrl,
-        mkey: mkey || DEFAULT_MKEY,
+        mkey,
         body: success ? 'SECOP accepted the token' : 'SECOP rejected the token (check finalUrl)',
       };
     } catch (gotoErr) {
@@ -347,7 +404,7 @@ async function checkWithSecopBrowser(token, siteKey = SITE_KEY) {
         status: 0,
         url: checkUrl,
         finalUrl: page.url(),
-        mkey: mkey || DEFAULT_MKEY,
+        mkey,
         error: gotoErr.message,
       };
     }
@@ -427,7 +484,7 @@ async function solveWithPuppeteer(url, siteKeyOverride, browser = null) {
         'https://community.secop.gov.co/Public/Tendering/ContractNoticeManagement/Index?currentLanguage=es-CO&Page=login&Country=CO&SkinName=CCE'
       );
       await page.goto(
-        `https://community.secop.gov.co/Public/Common/GoogleReCaptcha/Index?previousUrl=${previousUrl}`,
+        `${SECOP_CAPTCHA_INDEX_URL}?previousUrl=${previousUrl}`,
         { waitUntil: 'networkidle0', timeout: 30000 }
       );
     }
@@ -453,13 +510,26 @@ async function solveWithPuppeteer(url, siteKeyOverride, browser = null) {
     // Click the checkbox — this triggers token generation
     await anchorFrame.click('.recaptcha-checkbox-border', { count: 1 });
 
-    // Poll for the token value in #recaptcha-token
+    // Poll for the token value in #recaptcha-token. If the checkbox never
+    // turns checked, Google served an interactive (image/audio) challenge
+    // that this local solver cannot complete — fail fast with a clear error.
     for (let i = 0; i < TOKEN_MAX_POLLS; i++) {
       await delay(TOKEN_POLL_MS);
       const token = await anchorFrame.evaluate(() =>
         document.getElementById('recaptcha-token')?.value || ''
       );
       if (token && token.length > 100) return token;
+
+      if (i >= TOKEN_CHALLENGE_GRACE_POLLS) {
+        const checked = await anchorFrame
+          .$eval('.recaptcha-checkbox', (el) => el.classList.contains('recaptcha-checkbox-checked'))
+          .catch(() => false);
+        if (!checked) {
+          throw new Error(
+            'reCAPTCHA served an interactive challenge (image/audio) — the local solver cannot complete it; use method "service" (farm)'
+          );
+        }
+      }
     }
 
     throw new Error('reCAPTCHA solve timeout — no token obtained from anchor frame');
@@ -476,20 +546,9 @@ async function solveWithPuppeteer(url, siteKeyOverride, browser = null) {
 // ---------------------------------------------------------------------------
 
 /**
- * Check if Google verification should be skipped.
- * Falls back gracefully when VERIFY_WITH_GOOGLE is set to 'false'.
- */
-function shouldSkipGoogleVerification() {
-  const val = process.env.VERIFY_WITH_GOOGLE;
-  if (val === undefined) return false;
-  return val.toLowerCase() === 'false' || val === '0' || val === 'no';
-}
-
-/**
  * Solve a reCAPTCHA: try the primary farm first, fall back to the other.
- *
- * @param {string} siteKey   - reCAPTCHA site key
- * @returns {string}         - solved token
+ * Returns the raw token string — the caller must submit it to SECOP itself;
+ * nothing here consumes it.
  */
 async function solve(siteKey, farmService) {
   const apiKey = process.env.RECAPTCHA_SERVICE_KEY;
@@ -552,89 +611,77 @@ async function main() {
   if (!command) {
     console.log(`\nSECOP reCAPTCHA Solver — ponytail edition\n`);
     console.log('Commands:');
-    console.log('  node src/solver-ponytail.js solve [url]       Solve reCAPTCHA (service farm)');
+    console.log('  node src/solver-ponytail.js solve [url]            Solve reCAPTCHA (service farm)');
     console.log('  node src/solver-ponytail.js solve-puppeteer [url]  Solve with local browser');
-    console.log('  node src/solver-ponytail.js verify <token>     Verify with Google');
-    console.log('  node src/solver-ponytail.js check <token>      Check with SECOP');
+    console.log('  node src/solver-ponytail.js balance                Show farm account balance (free)');
+    console.log('  node src/solver-ponytail.js verify <token>         Google siteverify (consumes the token)');
+    console.log('  node src/solver-ponytail.js check <token>          SECOP CaptchaCheck (consumes the token)');
     console.log(`\nSite key: ${SITE_KEY}`);
-    console.log(`Env: RECAPTCHA_SERVICE_KEY, CAPSOLVER_API_KEY, FARM_SERVICE, VERIFY_WITH_GOOGLE, PORT\n`);
+    console.log(`Env: RECAPTCHA_SERVICE_KEY, CAPSOLVER_API_KEY, FARM_SERVICE, PORT\n`);
     process.exit(0);
   }
 
   switch (command) {
     // ── solve via 2Captcha / CapSolver ────────────────────────────────
     case 'solve': {
-      const url = args[1];
       const farm = process.env.FARM_SERVICE || '2captcha';
-      console.log(`\n[1/3] Solving reCAPTCHA (farm: ${farm})`);
+      console.log(`\n[1/1] Solving reCAPTCHA (farm: ${farm})`);
       const token = await solve(SITE_KEY, farm);
       console.log(`  Token: ${token.substring(0, 50)}...`);
+      console.log(`  Note: single-use, expires in ~${TOKEN_TTL_SECONDS}s — submit it to SECOP immediately.`);
 
-      const skipGoogle = shouldSkipGoogleVerification();
-      let google;
-
-      if (skipGoogle) {
-        console.log('\n[2/3] Verifying with Google...');
-        console.log(`  skipped (VERIFY_WITH_GOOGLE=false) — token accepted anyway`);
-        google = { success: true, skipped: true, hostname: 'community.secop.gov.co' };
-      } else {
-        console.log('\n[2/3] Verifying with Google...');
-        google = await verifyWithGoogle(token, SITE_KEY);
-        console.log(`  success: ${google.success}  hostname: ${google.hostname}  score: ${google.score}`);
-        if (!google.success && google.error) {
-          console.log(`  note: ${google.error} (token still valid for SECOP)`);
-        }
-      }
-
-      console.log('\n[3/3] Checking with SECOP...');
-      const secop = await checkWithSecop(token);
-      console.log(`  success: ${secop.success}  status: ${secop.status}`);
-
-      // Write result to stdout as JSON for CLI consumers
-      console.log(JSON.stringify({ success: true, token, google, secop }));
+      // Write result to stdout as JSON for CLI consumers. No verification
+      // step here: siteverify/CaptchaCheck would consume the token.
+      console.log(JSON.stringify({ success: true, token, expiresIn: TOKEN_TTL_SECONDS }));
       break;
     }
 
     // ── solve with local puppeteer (no farm) ──────────────────────────
     case 'solve-puppeteer': {
       const url = args[1];
-      console.log(`\n[1/2] Solving with local browser${url ? ` on ${url}` : ''}`);
+      console.log(`\n[1/1] Solving with local browser${url ? ` on ${url}` : ''}`);
       const token = await solveWithPuppeteer(url);
       console.log(`  Token: ${token.substring(0, 50)}...`);
-
-      const skipGoogle = shouldSkipGoogleVerification();
-      let google;
-
-      if (skipGoogle) {
-        console.log('\n[2/2] Verifying with Google...');
-        console.log(`  skipped (VERIFY_WITH_GOOGLE=false) — token accepted anyway`);
-        google = { success: true, skipped: true, hostname: 'community.secop.gov.co' };
-      } else {
-        console.log('\n[2/2] Verifying with Google...');
-        google = await verifyWithGoogle(token, SITE_KEY);
-        console.log(`  success: ${google.success}`);
-        if (!google.success && google.error) {
-          console.log(`  note: ${google.error} (token still valid for SECOP)`);
-        }
-      }
-
-      console.log(JSON.stringify({ success: true, token, google }));
+      console.log(`  Note: single-use, expires in ~${TOKEN_TTL_SECONDS}s — submit it to SECOP immediately.`);
+      console.log(JSON.stringify({ success: true, token, expiresIn: TOKEN_TTL_SECONDS }));
       break;
     }
 
-    // ── verify with Google ────────────────────────────────────────────
+    // ── farm balance (free) ───────────────────────────────────────────
+    case 'balance': {
+      const apiKey = process.env.RECAPTCHA_SERVICE_KEY;
+      const capSolverKey = process.env.CAPSOLVER_API_KEY;
+      const out = {};
+      if (apiKey) {
+        out['2captcha'] = await get2CaptchaBalance(apiKey);
+      }
+      if (capSolverKey) {
+        // CapSolver has no free balance endpoint on the legacy API; report presence only
+        out.capsolver = 'key set (no free balance endpoint)';
+      }
+      if (!apiKey && !capSolverKey) {
+        console.error('No farm keys configured (RECAPTCHA_SERVICE_KEY / CAPSOLVER_API_KEY)');
+        process.exit(1);
+      }
+      console.log(JSON.stringify(out, null, 2));
+      break;
+    }
+
+    // ── verify with Google (DESTRUCTIVE — consumes the token) ────────
     case 'verify': {
       const token = args[1];
       if (!token) { console.error('Usage: solver-ponytail.js verify <token>'); process.exit(1); }
+      console.error('Note: siteverify consumes this single-use token.');
       const google = await verifyWithGoogle(token, SITE_KEY);
       console.log(JSON.stringify(google, null, 2));
       break;
     }
 
-    // ── check with SECOP ──────────────────────────────────────────────
+    // ── check with SECOP (DESTRUCTIVE — consumes the token) ──────────
     case 'check': {
       const token = args[1];
       if (!token) { console.error('Usage: solver-ponytail.js check <token>'); process.exit(1); }
+      console.error('Note: CaptchaCheck consumes this single-use token and is session-bound (use test/live.test.js for the full flow).');
       const secop = await checkWithSecop(token);
       console.log(JSON.stringify(secop, null, 2));
       break;
@@ -662,14 +709,17 @@ if (require.main === module) {
 module.exports = {
   solveVia2Captcha,
   solveViaCapSolver,
+  get2CaptchaBalance,
   solve,
   solveWithPuppeteer,
   verifyWithGoogle,
+  fetchSecopSession,
+  fetchSecopMkey,
   checkWithSecop,
   checkWithSecopBrowser,
-  shouldSkipGoogleVerification,
   SITE_KEY,
+  SECOP_CAPTCHA_INDEX_URL,
   SECOP_CAPTCHA_CHECK_URL,
-  DEFAULT_MKEY,
   USER_AGENT,
+  TOKEN_TTL_SECONDS,
 };

@@ -8,10 +8,13 @@
     "dev": "node --watch src/server-ponytail.js",
     "solve": "node src/solver-ponytail.js solve",
     "solve-puppeteer": "node src/solver-ponytail.js solve-puppeteer",
+    "balance": "node src/solver-ponytail.js balance",
     "verify": "node src/solver-ponytail.js verify",
     "check": "node src/solver-ponytail.js check",
     "test": "node test/solver.test.js",
-    "e2e": "node test/e2e.test.js"
+    "e2e": "node test/e2e.test.js",
+    "live": "node test/live.test.js",
+    "live:paid": "node test/live.test.js --paid"
   },
   "dependencies": {
     "dotenv": "^18.0.9",

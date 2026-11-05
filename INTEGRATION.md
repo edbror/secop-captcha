@@ -36,14 +36,14 @@ El scraper descarga documentos de SECOP II con Chromium headless (Playwright). C
 | Variable | Descripción | Default |
 |---|---|---|
 | `RECAPTCHA_SERVICE_KEY` | API key de 2Captcha (primaria) | — |
-| `CAPSOLVER_API_KEY` | API key de CapSolver (fallback) | — |
+| `CAPSOLVER_API_KEY` | API key de CapSolver (fallback). Dejar vacía si no se usa | — |
 | `FARM_SERVICE` | Granja por defecto: `"2captcha"` o `"capsolver"` | `"2captcha"` |
 | `PORT` | Puerto del servidor | `3000` |
-| `HOST` | Dirección de bind | `"127.0.0.1"` |
+| `HOST` | Dirección de bind | `127.0.0.1` |
 | `SECOP_CAPTCHA_API_KEY` | API key para autenticar endpoints | — |
 | `MAX_CONCURRENT` | Máximo de peticiones simultáneas | `10` |
-| `VERIFY_WITH_GOOGLE` | `"true"` para activar Google siteverify | `"true"` |
-| `PUPPETEER_EXECUTABLE_PATH` | Ruta al binario de Chrome | Auto-detect |
+| `MOCK_SOLVER` | `"true"` para devolver tokens falsos (solo testing) | `false` |
+| `PUPPETEER_EXECUTABLE_PATH` | Ruta al binario de Chrome | Chromium bundled de puppeteer |
 
 **Endpoints:**
 
@@ -99,27 +99,35 @@ El scraper descarga documentos de SECOP II con Chromium headless (Playwright). C
                           ▼
 2. _captcha_enabled() → ¿SECOP_CAPTCHA_URL en os.environ?
                           │
-                         NO → raise Captcha (comportamiento original)
+                          NO → raise Captcha (comportamiento original)
                           │
-                         SÍ
+                          SÍ
                           │
                           ▼
 3. solve_captcha(solve_url)
    ├── requests.post("/solve", json={"method": "service", "url": url, "fallback": True})
    ├── Reintentos hasta timeout (120s default), sleep 2s entre intentos
-   └── Devuelve token o None
+   └── Devuelve token o None (el servicio NO verifica el token: lo entrega
+       intacto porque es de un solo uso y caduca ~2 min)
                           │
                           ▼
-4. _inject_token(page, token)
+4. _inject_token(page, token)   ← MISMA sesión del navegador, siempre
+   ├── Recarga la página del captcha → mkey FRESCO (el de la carga original
+   │   caducó durante la resolución de la granja, 10-120 s)
+   ├── Extrae el mkey de btnCaptchaCheckButton (sin fallback hardcodeado)
    ├── Inyecta token en g-recaptcha-response y txaresponseKey del DOM
-   ├── Si estamos en GoogleReCaptcha page: navega a CaptchaCheck
-   └── Valida token con SECOP (/Public/Common/GoogleReCaptcha/CaptchaCheck)
+   └── Navega a CaptchaCheck YA (única entrega del token de un solo uso)
                           │
                           ▼
 5. Reintentar browser_download con el token inyectado
    ├── Éxito → descarga el documento
    └── Falla → retry (máx. 3 rondas)
 ```
+
+Regla de oro del token: **un solo uso, ~2 min de vida**. Ni el servicio ni
+el scraper deben tocar siteverify/CaptchaCheck antes de la entrega final en
+la sesión que quiere acceder; una verificación "extra" quema el token y la
+suma real llega duplicada ("timeout-or-duplicate" en Google).
 
 ## Integración con Docker Compose
 
@@ -348,5 +356,5 @@ Los errores (≥ 400) van a `stderr` con `console.error()`. Los warnings de auth
 | Paquete | Versión | Uso |
 |---|---|---|
 | `dotenv` | ^18.0.9 | Carga variables de entorno desde `.env` |
-| `puppeteer` | ^23.0.0 | Browser headless para resolución local |
+| `puppeteer` | ^25.16.0 | Browser headless para resolución local |
 | `requests` | — | Cliente HTTP del scraper (pip) |
