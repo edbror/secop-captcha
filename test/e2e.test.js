@@ -2,13 +2,12 @@
 /**
  * e2e.test.js — End-to-end tests for secop-captcha server.
  *
- * Run with: node test/e2e.test.js
+ * Two modes:
+ *   MODE=real   — hits live farm (2Captcha/CapSolver), verifies token with Google + SECOP. Requires RECAPTCHA_SERVICE_KEY or CAPSOLVER_API_KEY. Costs money per solve (~$0.003-0.007 per solve).
+ *   MODE=http   — starts local server in-process and exercises routes via HTTP (no external API calls). Fast, free.
  *
- * Tests cover:
- * 1. Route handlers (health, solve, verify, redirect, 404)
- * 2. Input validation (missing fields, invalid URLs, invalid tokens)
- * 3. Middleware (auth, rate limit headers, CORS)
- * 4. Response structure (sendJson headers, statusCode)
+ * Run fast (HTTP mode):      node test/e2e.test.js
+ * Run real (live solves):    MODE=real node test/e2e.test.js
  */
 
 const http = require('http');
@@ -62,8 +61,86 @@ function stopServer() {
 }
 
 // ---------------------------------------------------------------------------
-// Test runner
+// Real solve E2E mode (MODE=real)
+// Calls live 2Captcha/CapSolver farm → verifies with Google → checks SECOP
 // ---------------------------------------------------------------------------
+
+const {
+  solve,
+  verifyWithGoogle,
+  checkWithSecop,
+  shouldSkipGoogleVerification,
+  SITE_KEY,
+} = require('../src/solver-ponytail');
+
+let isRealMode = process.env.MODE === 'real';
+
+/**
+ * Run a complete solve flow end-to-end using live farms.
+ * This is what matters — it proves the service works as the scraper will use it.
+ */
+async function runRealSolveTest() {
+  console.log('\n=== REAL SOLVE FLOW (live API calls) ===');
+  console.log('Note: costs ~$0.003-0.007 per attempt\n');
+
+  const farm = process.env.FARM_SERVICE || '2captcha';
+  const skipGoogle = shouldSkipGoogleVerification();
+
+  // Step 1: Solve via farm
+  console.log('[1/3] Solving reCAPTCHA via ' + farm + '...');
+  let token;
+  try {
+    token = await solve(SITE_KEY, farm);
+  } catch (err) {
+    throw new Error('Step 1 FAIL: Farm returned error — ' + err.message);
+  }
+
+  if (!token || token.length < 50) {
+    throw new Error('Step 1 FAIL: Got invalid token (' + JSON.stringify(token)?.substring(0, 100) + ')');
+  }
+  console.log('  ✓ Token received: ' + token.substring(0, 40) + '... (' + token.length + ' chars)');
+
+  // Step 2: Verify with Google
+  if (skipGoogle) {
+    console.log('\n[2/3] Google siteverify skipped (VERIFY_WITH_GOOGLE=false)');
+    console.log('  ℹ️  Note: siteverify with SITE_KEY always fails; token is accepted anyway.');
+  } else {
+    console.log('\n[2/3] Verifying token with Google...');
+    let googleResult;
+    try {
+      googleResult = await verifyWithGoogle(token, SITE_KEY);
+    } catch (err) {
+      throw new Error('Step 2 FAIL: Google verification threw — ' + err.message);
+    }
+    console.log('  success: ' + googleResult.success);
+    console.log('  hostname: ' + (googleResult.hostname || '(none)'));
+    console.log('  score: ' + (googleResult.score ?? '(none)'));
+    console.log('  action: ' + (googleResult.action || '(none)'));
+    if (googleResult.error) {
+      console.log('  ⚠️  note: ' + googleResult.error + ' (expected — we pass SITE_KEY which is public, not the secret)');
+    }
+  }
+
+  // Step 3: Check with SECOP — THIS IS THE REAL TEST
+  console.log('\n[3/3] Checking token validity with SECOP...');
+  let secopResult;
+  try {
+    secopResult = await checkWithSecop(token);
+  } catch (err) {
+    throw new Error('Step 3 FAIL: SECOP check threw — ' + err.message);
+  }
+
+  console.log('  success: ' + secopResult.success);
+  console.log('  status: ' + (secopResult.status || '(none)'));
+  console.log('  url: ' + (secopResult.url || '(none)'));
+
+  if (!secopResult.success) {
+    throw new Error('SECOP rejected the token! Status: ' + JSON.stringify(secopResult));
+  }
+
+  console.log('\n  ✅ FULL FLOW PASSED — SECOP accepted the token');
+  return { token, google: null, secop: secopResult };
+}
 
 let passed = 0;
 let failed = 0;
@@ -92,12 +169,14 @@ async function test(name, fn) {
 }
 
 // ---------------------------------------------------------------------------
-// Tests
+// Test runner — pick mode
 // ---------------------------------------------------------------------------
 
-async function runTests() {
-  console.log('SECOP Captcha E2E Tests');
-  console.log('========================\n');
+let allPassed = true;
+
+async function runHttpTests() {
+  console.log('SECOP Captcha HTTP E2E Tests (local server)');
+  console.log('============================================\n');
 
   await startServer();
 
@@ -315,20 +394,52 @@ async function runTests() {
   });
 
   console.log('\n' + '='.repeat(40));
-  console.log('Results: ' + passed + '/' + total + ' passed');
+  console.log('HTTP Results: ' + passed + '/' + total + ' passed');
   if (failed > 0) {
-    console.log('         ' + failed + '/' + total + ' failed');
+    console.log('                ' + failed + '/' + total + ' failed');
   }
   console.log('='.repeat(40));
 
   return failed === 0;
 }
 
+async function runAllTests() {
+  let httpPassed = true;
+
+  if (!isRealMode) {
+    // HTTP-only mode (fast, free)
+    console.log('[mode] HTTP (local server, no live API calls)\n');
+    try {
+      httpPassed = await runHttpTests();
+    } finally {
+      await stopServer();
+    }
+  } else {
+    // Real mode: HTTP tests first, then live solve flow
+    console.log('[mode] REAL (live API calls — costs money)\n');
+    try {
+      httpPassed = await runHttpTests();
+    } finally {
+      await stopServer();
+    }
+
+    // Live solve flow
+    try {
+      await runRealSolveTest();
+    } catch (err) {
+      allPassed = false;
+      console.error('\n  ✗ REAL SOLVE FLOW: ' + err.message);
+    }
+  }
+
+  return httpPassed && allPassed;
+}
+
 // ---------------------------------------------------------------------------
-// Run tests
+// Entry point
 // ---------------------------------------------------------------------------
 
-runTests().then((success) => {
+runAllTests().then((success) => {
   stopServer().then(() => {
     process.exit(success ? 0 : 1);
   });

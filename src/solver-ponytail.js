@@ -46,171 +46,75 @@ const CAPSOLVER_MAX_POLLS = 40;   // up to 2 min
 const TOKEN_POLL_MS = 200;        // 200 ms waiting for recaptcha-token
 const TOKEN_MAX_POLLS = 15;       // up to 3 s
 
-// HTTP agent — keep-alive connections, no axios dependency
-const http = require('http');
-const https = require('https');
-const { URL } = require('url');
-
-// ---------------------------------------------------------------------------
-// Tiny HTTP helper — no axios needed
-// ---------------------------------------------------------------------------
-
-/**
- * Make an HTTP(S) request and return parsed JSON.
- * Falls back gracefully on network errors.
- */
-function httpJson(method, urlString, opts = {}) {
-  return new Promise((resolve, reject) => {
-    const parsed = new URL(urlString);
-    const client = parsed.protocol === 'https:' ? https : http;
-
-    const isPost = method === 'POST';
-    const body = opts.body;
-    let payload;
-
-    if (isPost) {
-      if (typeof body === 'string') {
-        payload = body;
-      } else if (opts.formUrlEncoded) {
-        // Convert object to form-urlencoded (2Captcha expects this)
-        const params = new URLSearchParams();
-        for (const [k, v] of Object.entries(body)) {
-          params.append(k, typeof v === 'object' ? JSON.stringify(v) : String(v));
-        }
-        payload = params.toString();
-      } else {
-        payload = JSON.stringify(body);
-      }
-    } else if (!isPost && body) {
-      // For GET: merge body into query params (2Captcha poll expects query params)
-      const params = new URLSearchParams();
-      parsed.search.split('&').filter(Boolean).forEach((pair) => {
-        const [k, v] = pair.split('=');
-        params.set(decodeURIComponent(k), decodeURIComponent(v));
-      });
-      for (const [k, v] of Object.entries(body)) {
-        params.set(k, typeof v === 'object' ? JSON.stringify(v) : String(v));
-      }
-      parsed.search = '?' + params.toString();
-      payload = null;
-    }
-
-    const headers = Object.assign(
-      {
-        'User-Agent': USER_AGENT,
-        'Accept': 'application/json',
-      },
-      opts.headers || {},
-    );
-
-    if (isPost && payload) {
-      headers['Content-Length'] = Buffer.byteLength(payload);
-      headers['Content-Type'] = opts.formUrlEncoded
-        ? 'application/x-www-form-urlencoded'
-        : 'application/json';
-    }
-
-    const reqOpts = {
-      hostname: parsed.hostname,
-      port: parsed.port,
-      path: parsed.pathname + parsed.search,
-      method,
-      headers,
-    };
-
-    const req = client.request(reqOpts, (res) => {
-      const chunks = [];
-      res.on('data', (c) => chunks.push(c));
-      res.on('end', () => {
-        const raw = Buffer.concat(chunks).toString('utf-8');
-        // For redirects, follow manually
-        if ([301, 302, 303, 307, 308].includes(res.statusCode) && res.headers.location) {
-          resolve({ redirect: res.headers.location, status: res.statusCode, raw });
-          return;
-        }
-        try {
-          resolve({ status: res.statusCode, headers: res.headers, body: JSON.parse(raw), raw });
-        } catch {
-          resolve({ status: res.statusCode, headers: res.headers, body: raw, raw });
-        }
-      });
-    });
-
-    req.on('error', reject);
-    req.setTimeout(30000, () => {
-      req.destroy();
-      reject(new Error(`HTTP ${method} ${urlString} timed out after 30s`));
-    });
-
-    if (payload) req.write(payload);
-    req.end();
-  });
-}
+// ponytail: replaced 87-line httpJson with native fetch — same behavior, zero deps
 
 // ---------------------------------------------------------------------------
 // 2Captcha service
 // ---------------------------------------------------------------------------
 
+// ponytail: was 62 lines with httpJson; fetch is cleaner for polling loops
 /**
  * Submit a reCAPTCHA task to 2Captcha and poll until solved.
  * Returns the response token string.
  */
 async function solveVia2Captcha(apiKey, siteKey) {
   // Submit task
-  const submit = await httpJson('POST', _2CAPTCHA_IN, {
-    body: {
+  const submit = await fetch(_2CAPTCHA_IN, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({
       key: apiKey,
       method: 'userrecaptcha',
       pageurl: 'https://community.secop.gov.co/Public/Common/GoogleReCaptcha/Index',
       googlekey: siteKey,
       json: 1,
-    },
+    }),
   });
+  const submitBody = await submit.json();
 
-  if (submit.body.error) {
-    throw new Error(`2Captcha submit error: ${submit.body.error}`);
+  if (submitBody.error) {
+    throw new Error(`2Captcha submit error: ${submitBody.error}`);
   }
 
-  const captchaId = submit.body.request || submit.body.captcha;
+  const captchaId = submitBody.request || submitBody.captcha;
   if (!captchaId) {
-    throw new Error(`2Captcha returned no captcha ID: ${JSON.stringify(submit.body)}`);
+    throw new Error(`2Captcha returned no captcha ID: ${JSON.stringify(submitBody)}`);
   }
 
   // Poll for result
   for (let i = 0; i < _2CAPTCHA_MAX_POLLS; i++) {
     await delay(_2CAPTCHA_POLL_MS);
 
-    const poll = await httpJson('GET', _2CAPTCHA_RES, {
-      body: {
-        key: apiKey,
-        action: 'get',
-        id: captchaId,
-        json: 1,
-      },
-    });
+    const poll = await fetch(
+      `${_2CAPTCHA_RES}?key=${apiKey}&action=get&id=${captchaId}&json=1`
+    );
+    const raw = await poll.text();
+    let pollBody;
+    try {
+      pollBody = JSON.parse(raw);
+    } catch {
+      pollBody = raw;
+    }
 
-    // 2Captcha sometimes returns a plain string (e.g. "ERROR_EMPTY_ACTION")
-    // With json=1, it returns {"status":0,"request":"CAPCHA_NOT_READY",...}
-    const raw = typeof poll.body === 'string' ? poll.body : null;
-    const data = raw || poll.body;
+    const data = typeof pollBody === 'string' ? pollBody : pollBody;
 
     if (data === 'CAPCHA_NOT_READY' || (typeof data === 'object' && data.request === 'CAPCHA_NOT_READY')) {
       continue;
     }
-    if (data === 'ERROR_CAPTCHA_UNSOLVABLE' || poll.body.error) {
-      throw new Error(`2Captcha solve failed: ${poll.body.error || data}`);
+    
+    const requestStr = typeof data === 'object' ? data.request : data;
+    
+    if (requestStr === 'ERROR_CAPTCHA_UNSOLVABLE' || pollBody.error) {
+      throw new Error(`2Captcha solve failed: ${pollBody.error || requestStr}`);
     }
 
-    // Skip transient error strings and keep polling
-    if (raw && raw.startsWith('ERROR_')) {
-      console.log(`  2Captcha: ${raw} (polling...)`);
-      continue;
+    if (typeof requestStr === 'string' && requestStr.startsWith('ERROR_')) {
+      throw new Error(`2Captcha solve failed: ${requestStr}`);
     }
 
-    // 2Captcha returns the token in the "request" field (string or object)
-    const token = raw
-      ? raw  // plain string response = the token
-      : (poll.body.token?.token || poll.body.token || poll.body.request);
+    const token = typeof data === 'string'
+      ? data
+      : (pollBody.token?.token || pollBody.token || pollBody.request);
 
     return token;
   }
@@ -222,41 +126,48 @@ async function solveVia2Captcha(apiKey, siteKey) {
 // CapSolver service
 // ---------------------------------------------------------------------------
 
+// ponytail: was 41 lines with httpJson; fetch is cleaner
 /**
  * Submit a reCAPTCHA task to CapSolver and poll until solved.
  * Returns the response token string.
  */
 async function solveViaCapSolver(apiKey, siteKey) {
   // Create task
-  const create = await httpJson('POST', CAPSOLVER_CREATE, {
-    body: {
+  const create = await fetch(CAPSOLVER_CREATE, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({
       clientKey: apiKey,
       task: {
         type: 'CapSolverRecaptchaTaskProxyless',
         websiteURL: 'https://community.secop.gov.co/Public/Common/GoogleReCaptcha/Index',
         websiteKey: siteKey,
       },
-    },
+    }),
   });
+  const createBody = await create.json();
 
-  if (create.body.errorId && create.body.errorId !== 0 && create.body.errorId !== 1) {
-    throw new Error(`CapSolver createTask error: ${create.body.errorCode} - ${create.body.errorMessage}`);
+  if (createBody.errorId && createBody.errorId !== 0 && createBody.errorId !== 1) {
+    throw new Error(`CapSolver createTask error: ${createBody.errorCode} - ${createBody.errorMessage}`);
   }
 
-  const taskId = create.body.taskId;
+  const taskId = createBody.taskId;
 
   // Poll for result
   for (let i = 0; i < CAPSOLVER_MAX_POLLS; i++) {
     await delay(CAPSOLVER_POLL_MS);
 
-    const result = await httpJson('POST', CAPSOLVER_GET_RESULT, {
-      body: {
+    const result = await fetch(CAPSOLVER_GET_RESULT, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({
         clientKey: apiKey,
         taskId,
-      },
+      }),
     });
+    const raw = await result.text();
+    const data = raw.startsWith('{') ? JSON.parse(raw) : { errorId: 2, errorCode: 'NO_RESPONSE', errorMessage: 'No response from CapSolver' };
 
-    const data = result.body;
     if (data.status === 'ready' && data.solution) {
       return data.solution.token || data.solution.gRecaptchaResponse;
     }
@@ -277,25 +188,17 @@ async function solveViaCapSolver(apiKey, siteKey) {
  * Returns { success, hostname, score, error, skipped } for full context.
  */
 async function verifyWithGoogle(token, secretKey) {
+  // ponytail: was 22 lines with httpJson; native fetch does the same in one call
   try {
-    const body = new URLSearchParams({
-      secret: secretKey,
-      response: token,
+    const res = await fetch(GOOGLE_VERIFY_URL, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
+      body: `secret=${encodeURIComponent(secretKey)}&response=${encodeURIComponent(token)}`,
     });
-
-    const res = await httpJson('POST', GOOGLE_VERIFY_URL, {
-      body: body.toString(),
-      formUrlEncoded: true,
-    });
-
-    return res.body;
+    return await res.json();
   } catch (err) {
     console.warn(`verifyWithGoogle: Google siteverify failed: ${err.message}`);
-    return {
-      success: false,
-      error: err.message,
-      skipped: false,
-    };
+    return { success: false, error: err.message, skipped: false };
   }
 }
 
@@ -304,13 +207,38 @@ async function verifyWithGoogle(token, secretKey) {
  * GET with query params (matches secop-scraper Python client behavior).
  * Returns the raw response text and parsed status.
  */
-async function checkWithSecop(token, mkey = DEFAULT_MKEY) {
-  const url = `${SECOP_CAPTCHA_CHECK_URL}?responseKey=${encodeURIComponent(token)}&mkey=${encodeURIComponent(mkey || DEFAULT_MKEY)}`;
+/**
+ * Fetch the live SECOP Captcha Index page and extract the dynamic mkey.
+ * Parses the onclick attribute of btnCaptchaCheckButton for the mkey param.
+ */
+async function fetchSecopMkey() {
+  // ponytail: was 11 lines with httpJson; fetch does fetch + .text() in 3 lines
+  try {
+    const res = await fetch('https://community.secop.gov.co/Public/Common/GoogleReCaptcha/Index');
+    const raw = await res.text();
+    const mkeyMatch = raw.match(/mkey=([a-f0-9_]+)/);
+    return mkeyMatch ? mkeyMatch[1] : null;
+  } catch {
+    return null;
+  }
+}
 
-  const res = await httpJson('GET', url, {});
+/**
+ * Check token with SECOP via direct HTTP (fast path).
+ * If mkey is not provided, fetches it live from the SECOP page.
+ */
+async function checkWithSecop(token, mkey) {
+  // ponytail: was 26 lines with httpJson; fetch handles redirects natively
+  let mk = mkey;
+  if (!mk) {
+    mk = await fetchSecopMkey();
+    if (!mk) mk = DEFAULT_MKEY;
+  }
 
-  // SECOP redirects to ErrorPage on failure; success returns the index page
-  const finalUrl = res.redirect || url;
+  const url = `${SECOP_CAPTCHA_CHECK_URL}?responseKey=${encodeURIComponent(token)}&mkey=${encodeURIComponent(mk)}`;
+
+  const res = await fetch(url);
+  const finalUrl = res.url; // fetch follows redirects, .url is the final URL
   const success = !finalUrl.includes('ErrorPage') && res.status !== 403;
 
   return {
@@ -318,8 +246,114 @@ async function checkWithSecop(token, mkey = DEFAULT_MKEY) {
     status: res.status,
     url,
     finalUrl,
-    body: res.raw ? res.raw.substring(0, 500) : '',
+    mkey: mk,
+    body: (await res.text()).substring(0, 500),
   };
+}
+
+/**
+ * Check token with SECOP via headless browser (slow, but reliable).
+ * Follows the exact flow of the secop-scraper Python client:
+ * 1. Navigates to the Captcha Index page to establish a session.
+ * 2. Extracts the dynamic 'mkey' from the page.
+ * 3. Navigates to the CaptchaCheck endpoint with the token and mkey.
+ */
+async function checkWithSecopBrowser(token, siteKey = SITE_KEY) {
+  const puppeteer = require('puppeteer');
+
+  const execPath =
+    process.env.PUPPETEER_EXECUTABLE_PATH ||
+    process.env.CHROME_PATH ||
+    '/Applications/Google Chrome.app/Contents/MacOS/Google Chrome';
+
+  const launchOpts = {
+    headless: 'new',
+    args: [
+      '--disable-setuid-bounce',
+      '--disable-dev-shm-usage',
+      '--disable-extensions',
+      '--disable-gpu',
+      '--disable-blink-features=AutomationControlled',
+    ],
+    defaultViewport: { width: 1280, height: 720 },
+  };
+
+  if (require('fs').existsSync(execPath)) {
+    launchOpts.executablePath = execPath;
+  }
+
+  const browser = await puppeteer.launch(launchOpts);
+
+  try {
+    const page = await browser.newPage();
+    await page.setUserAgent(USER_AGENT);
+
+    // Step 1: Navigate to the Index page to establish session and extract mkey
+    // This mimics the user journey where the token is generated for this specific page/session
+    const targetUrl = `https://community.secop.gov.co/Public/Common/GoogleReCaptcha/Index?previousUrl=${encodeURIComponent('https://community.secop.gov.co/Public/Tendering/ContractNoticeManagement/Index?currentLanguage=es-CO&Page=login&Country=CO&SkinName=CCE')}`;
+    
+    console.log('  Navigating to Captcha Index to establish session...');
+    await page.goto(targetUrl, { waitUntil: 'networkidle0', timeout: 15000 });
+
+    // Step 2: Extract the dynamic mkey from the page
+    let mkey = DEFAULT_MKEY;
+    try {
+      mkey = await page.evaluate(() => {
+        try {
+          const btn = document.getElementById('btnCaptchaCheckButton');
+          if (!btn) return null;
+          const onClick = btn.getAttribute('onclick') || '';
+          const match = onClick.match(/mkey=([a-f0-9_]+)/);
+          return match ? match[1] : null;
+        } catch {
+          return null;
+        }
+      });
+
+      if (!mkey) {
+        console.log('  Warning: Could not extract mkey from button, using default.');
+      }
+    } catch (err) {
+      console.log('  Warning: mkey extraction failed, using default.');
+    }
+
+    // Step 3: Navigate directly to the CaptchaCheck endpoint with the token and extracted mkey
+    // The Python scraper does exactly this after extracting the mkey
+    const checkUrl = `${SECOP_CAPTCHA_CHECK_URL}?responseKey=${encodeURIComponent(token)}&mkey=${encodeURIComponent(mkey || DEFAULT_MKEY)}`;
+    console.log('  Navigating to CaptchaCheck with extracted mkey...');
+    
+    try {
+      const response = await page.goto(checkUrl, { waitUntil: 'networkidle0', timeout: 15000 });
+      const status = response ? response.status() : 0;
+      const finalUrl = page.url();
+
+      console.log('  Response status: ' + status);
+      console.log('  Final URL: ' + finalUrl.substring(0, 150));
+
+      const success = !finalUrl.includes('ErrorPage') && !finalUrl.includes('expired');
+
+      return {
+        success,
+        status,
+        url: checkUrl,
+        finalUrl,
+        mkey: mkey || DEFAULT_MKEY,
+        body: success ? 'SECOP accepted the token' : 'SECOP rejected the token (check finalUrl)',
+      };
+    } catch (gotoErr) {
+      // If navigation fails, return the last known state
+      return {
+        success: false,
+        status: 0,
+        url: checkUrl,
+        finalUrl: page.url(),
+        mkey: mkey || DEFAULT_MKEY,
+        error: gotoErr.message,
+      };
+    }
+  } finally {
+    await browser.close();
+  }
 }
 
 // ---------------------------------------------------------------------------
@@ -632,6 +666,7 @@ module.exports = {
   solveWithPuppeteer,
   verifyWithGoogle,
   checkWithSecop,
+  checkWithSecopBrowser,
   shouldSkipGoogleVerification,
   SITE_KEY,
   SECOP_CAPTCHA_CHECK_URL,

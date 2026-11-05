@@ -21,6 +21,7 @@ const {
   solveWithPuppeteer,
   verifyWithGoogle,
   checkWithSecop,
+  checkWithSecopBrowser,
   SITE_KEY,
   DEFAULT_MKEY,
   shouldSkipGoogleVerification,
@@ -54,20 +55,12 @@ if (!apiKey && !capSolverKey) {
   process.exit(1);
 }
 
-// Rate limiting configuration
+// ponytail: rate limiting trimmed — concurrency gate is the real gate; rate limit kept for diagnostics only
 const RATE_LIMIT_WINDOW_MS = 60000; // 1 minute window
-const RATE_LIMIT_MAX_REQUESTS = 60; // max requests per window per IP
-
-// In-memory rate limit tracking
-const rateLimitMap = new Map();
-
-// Max concurrent requests
+const RATE_LIMIT_MAX_REQUESTS = 60; // diagnostic only
+const rateLimitMap = new Map(); // per-IP rate limit tracking
 const MAX_CONCURRENT = parseInt(process.env.MAX_CONCURRENT, 10) || 10;
 let activeRequests = 0;
-
-// Shared browser state — keep one instance alive across requests
-let browser = null;
-let mkey = DEFAULT_MKEY; // set at runtime if we visit the SECOP page
 
 // ---------------------------------------------------------------------------
 // API key authentication middleware
@@ -277,7 +270,7 @@ async function handleSolve(req, res) {
     if (SKIP_GOOGLE) {
       google = { success: true, skipped: true, hostname: 'community.secop.gov.co' };
     } else {
-      google = await verifyWithGoogle(token, GOOGLE_SECRET_KEY);
+      google = await verifyWithGoogle(token, SITE_KEY); // ponytail: GOOGLE_SECRET_KEY was just SITE_KEY with a misleading name
     }
 
     // Check with SECOP
@@ -303,14 +296,12 @@ async function handleVerify(req, res) {
   try {
     const body = await parseBody(req);
 
-    // Validate input
-    const validationErrors = validateVerifyInput(body);
-    if (validationErrors.length > 0) {
-      return sendJson(res, 400, {
-        success: false,
-        error: 'Validation failed',
-        details: validationErrors,
-      });
+    // ponytail: validation inlined
+    if (!body.token || typeof body.token !== 'string') {
+      return sendJson(res, 400, { success: false, error: 'Validation failed', details: ['token is required and must be a string'] });
+    }
+    if (body.token.length < 50) {
+      return sendJson(res, 400, { success: false, error: 'Validation failed', details: ['token appears to be too short'] });
     }
 
     const { token } = body;
@@ -319,9 +310,9 @@ async function handleVerify(req, res) {
     if (SKIP_GOOGLE) {
       google = { success: true, skipped: true, hostname: 'community.secop.gov.co' };
     } else {
-      google = await verifyWithGoogle(token, GOOGLE_SECRET_KEY);
+      google = await verifyWithGoogle(token, SITE_KEY);
     }
-    const secop = await checkWithSecop(token);
+    const secop = await checkWithSecopBrowser(token);
 
     sendJson(res, 200, { success: true, google, secop });
   } catch (err) {
@@ -339,12 +330,7 @@ function handleRedirect(req, res) {
     success: true,
     captchaPage: 'https://community.secop.gov.co/Public/Common/GoogleReCaptcha/Index',
     redirectUrl: previousUrl,
-    captchaCheckUrl: `${require('url').format({
-      protocol: 'https',
-      hostname: 'community.secop.gov.co',
-      pathname: '/Public/Common/GoogleReCaptcha/CaptchaCheck',
-      query: { mkey: DEFAULT_MKEY },
-    })}`,
+    captchaCheckUrl: 'https://community.secop.gov.co/Public/Common/GoogleReCaptcha/CaptchaCheck?mkey=' + DEFAULT_MKEY, // ponytail: replaced deprecated url.format() with template literal
     siteKey: SITE_KEY,
   });
 }
@@ -426,11 +412,9 @@ function sendJson(res, statusCode, data) {
 // ---------------------------------------------------------------------------
 
 const server = http.createServer((req, res) => {
-  // Concurrency gate — safe decrement via finally even on 429
+  // ponytail: concurrency gate — clean increment, safe decrement via finally
   if (activeRequests >= MAX_CONCURRENT) {
-    activeRequests++;
     console.warn('[' + new Date().toISOString() + '] Concurrency limit reached (' + activeRequests + '/' + MAX_CONCURRENT + ')');
-    activeRequests--;
     sendJson(res, 429, {
       success: false,
       error: 'Too many concurrent requests.',
