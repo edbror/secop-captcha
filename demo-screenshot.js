@@ -1,9 +1,10 @@
+require('dotenv').config();
 const puppeteer = require('puppeteer');
-const { solveWithPuppeteer, SECOP_CAPTCHA_CHECK_URL, DEFAULT_MKEY } = require('./src/solver-ponytail');
+const { solve, SECOP_CAPTCHA_CHECK_URL, DEFAULT_MKEY, SITE_KEY } = require('./src/solver-ponytail');
 
 async function demo() {
-  console.log('Solving captcha using local browser...');
-  const token = await solveWithPuppeteer();
+  console.log('Solving captcha using 2captcha farm (this might take 30-60s)...');
+  const token = await solve(SITE_KEY, '2captcha');
   console.log('Got token:', token.substring(0, 40) + '...');
 
   const browser = await puppeteer.launch({ 
@@ -14,7 +15,8 @@ async function demo() {
   const page = await browser.newPage();
   
   console.log('Navigating to establish session and get mkey...');
-  await page.goto('https://community.secop.gov.co/Public/Common/GoogleReCaptcha/Index?previousUrl=' + encodeURIComponent('https://community.secop.gov.co/Public/Tendering/ContractNoticeManagement/Index'), { waitUntil: 'networkidle0' });
+  const targetUrl = 'https://community.secop.gov.co/Public/Tendering/ContractNoticeManagement/Index?currentLanguage=es-CO&Page=login&Country=CO&SkinName=CCE';
+  await page.goto('https://community.secop.gov.co/Public/Common/GoogleReCaptcha/Index?previousUrl=' + encodeURIComponent(targetUrl), { waitUntil: 'networkidle0' });
   
   let mkey = await page.evaluate(() => {
     const btn = document.getElementById('btnCaptchaCheckButton');
@@ -29,7 +31,9 @@ async function demo() {
   const checkUrl = `${SECOP_CAPTCHA_CHECK_URL}?responseKey=${encodeURIComponent(token)}&mkey=${encodeURIComponent(mkey || DEFAULT_MKEY)}`;
   await page.goto(checkUrl, { waitUntil: 'networkidle0' });
   
-  console.log('Final URL:', page.url());
+  console.log('Final URL before wait:', page.url());
+  await new Promise(r => setTimeout(r, 5000));
+  console.log('Final URL after wait:', page.url());
   
   await page.screenshot({ path: 'captcha-success.png', fullPage: true });
   console.log('Screenshot saved to captcha-success.png');
