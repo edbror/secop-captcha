@@ -1,0 +1,22 @@
+services:
+  secop-portal:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    image: secop-portal:0.1.0
+    container_name: secop-portal
+    ports:
+      - "3000:3000"
+    environment:
+      - PORT=3000
+      - HOST=0.0.0.0
+      - MAX_CONCURRENT=10
+      - FARM_SERVICE=2captcha
+      - RECAPTCHA_SERVICE_KEY=bfeedf34b0ca6783d71c16091b4a48bc
+      - SECOP_CAPTCHA_API_KEY=secop-portal-8a4b2c1d9e0f
+    volumes:
+      - secop-portal-data:/app/data
+    restart: unless-stopped
+
+volumes:
+  secop-portal-data:
